@@ -23,40 +23,35 @@ class OTPBot:
     def __init__(self):
         self.api_keys = []
         self.current_api_index = 0
-        self.blocked_until = {}
-        self.blocked_numbers_file = "blocked_numbers.json"
         self.rate_limit_wait = 3
         self.config_file = "config.json"
         self.is_running = False
         self.stop_requested = False
         
-        # ব্লক হ্যান্ডলিং এর জন্য ভেরিয়েবল
-        self.is_paused = False
-        self.pause_start_time = None
-        self.pause_duration = 3600  # 1 ঘন্টা = 3600 সেকেন্ড
-        self.pause_end_time = None
-        self.pause_reason = None
-        self.blocked_number = None
+        # ব্লক স্টেটাস
+        self.is_blocked = False
+        self.block_start_time = None
+        self.block_duration = 3600  # ১ ঘন্টা = 3600 সেকেন্ড
+        self.block_end_time = None
+        self.block_message_id = None
+        self.block_chat_id = None
         
         # প্রসেসিং স্টেট
         self.pending_numbers = []
-        self.current_processing_index = 0
+        self.current_number_index = 0
         self.use_whatsapp = False
         self.current_chat_id = None
         self.status_message = None
         self.file_path = None
         
-        # স্ট্যাটিসটিক্স
+        # স্ট্যাটিসটিক্স (শুধু সফল গুলো কাউন্ট হবে)
         self.stats = {
             'total_sent': 0,
-            'total_failed': 0,
-            'total_blocked': 0,
-            'total_pauses': 0,
-            'start_time': None
+            'start_time': None,
+            'total_cycles': 0
         }
         
         self.load_config()
-        self.load_blocked_numbers()
         
     def load_config(self):
         """Load API keys from config file"""
@@ -88,6 +83,639 @@ class OTPBot:
         """Add new API key to the pool"""
         for key in self.api_keys:
             if key['app_id'] == app_id and key['api_key'] == api_key:
+                return False, "এই API key আগেই যোগ করা আছে!"
+        
+        new_key = {
+            'app_id': app_id,
+            'api_key': api_key,
+            'added_on': datetime.now().isoformat(),
+            'added_by': user_id,
+            'is_active': True,
+            'error_count': 0,
+            'last_used': None
+        }
+        self.api_keys.append(new_key)
+        self.save_config()
+        return True, f"✅ API Key যোগ করা হয়েছে!\nমোট কী: {len(self.api_keys)}"
+    
+    def remove_api_key(self, index):
+        """Remove API key by index"""
+        if 0 <= index < len(self.api_keys):
+            removed = self.api_keys.pop(index)
+            self.save_config()
+            return True, f"✅ API key {index+1} সরানো হয়েছে"
+        return False, "❌ ভুল ইনডেক্স!"
+    
+    def get_current_api(self):
+        """Get current active API key"""
+        if not self.api_keys:
+            return None, None
+        
+        for i in range(len(self.api_keys)):
+            idx = (self.current_api_index + i) % len(self.api_keys)
+            if self.api_keys[idx].get('is_active', True):
+                self.current_api_index = idx
+                return self.api_keys[idx]['app_id'], self.api_keys[idx]['api_key']
+        
+        return None, None
+    
+    def switch_to_next_api(self):
+        """Switch to next available API key"""
+        if not self.api_keys:
+            return False
+        
+        if self.current_api_index < len(self.api_keys):
+            self.api_keys[self.current_api_index]['error_count'] = self.api_keys[self.current_api_index].get('error_count', 0) + 1
+            
+            if self.api_keys[self.current_api_index]['error_count'] >= 3:
+                self.api_keys[self.current_api_index]['is_active'] = False
+                logger.warning(f"API key {self.current_api_index + 1} deactivated due to multiple errors")
+                self.notify_admin(f"⚠️ API key {self.current_api_index + 1} ডিঅ্যাক্টিভ করা হয়েছে\nকারণ: ৩ বার ত্রুটি")
+        
+        start_idx = (self.current_api_index + 1) % len(self.api_keys)
+        for i in range(len(self.api_keys)):
+            idx = (start_idx + i) % len(self.api_keys)
+            if self.api_keys[idx].get('is_active', True):
+                self.current_api_index = idx
+                logger.info(f"Switched to API key {idx + 1}")
+                self.notify_admin(f"🔄 সুইচ করা হয়েছে API key {idx + 1} তে")
+                return True
+        
+        self.notify_admin("❌ কোনো একটিভ API key নেই!")
+        return False
+    
+    def notify_admin(self, message):
+        """Send notification to admin"""
+        try:
+            bot.send_message(ADMIN_ID, message)
+        except Exception as e:
+            logger.error(f"Failed to notify admin: {e}")
+    
+    def format_phone_number(self, phone):
+        """Format phone number"""
+        phone = phone.strip()
+        if not phone.startswith('+'):
+            phone = '+' + phone.lstrip('0')
+        return phone
+    
+    def show_block_timer(self, chat_id, remaining_seconds):
+        """ব্লক টাইমার বাটন দেখায়"""
+        minutes = remaining_seconds // 60
+        seconds = remaining_seconds % 60
+        
+        markup = InlineKeyboardMarkup(row_width=1)
+        timer_button = InlineKeyboardButton(
+            f"⏳ ব্লক: {minutes:02d}:{seconds:02d} বাকি",
+            callback_data="block_timer"
+        )
+        markup.add(timer_button)
+        
+        try:
+            if self.block_message_id:
+                bot.edit_message_text(
+                    f"🚫 **API ব্লক হয়েছে**\n\n"
+                    f"⏰ ১ ঘন্টার জন্য ব্লক\n"
+                    f"⏱️ সময় বাকি: {minutes} মিনিট {seconds} সেকেন্ড\n\n"
+                    f"⏸️ এই সময়ে কোন API কল হবে না\n"
+                    f"🔄 টাইম শেষে আবার শুরু হবে",
+                    chat_id,
+                    self.block_message_id,
+                    reply_markup=markup,
+                    parse_mode='Markdown'
+                )
+            else:
+                msg = bot.send_message(
+                    chat_id,
+                    f"🚫 **API ব্লক হয়েছে**\n\n"
+                    f"⏰ ১ ঘন্টার জন্য ব্লক\n"
+                    f"⏱️ সময় বাকি: {minutes} মিনিট {seconds} সেকেন্ড\n\n"
+                    f"⏸️ এই সময়ে কোন API কল হবে না\n"
+                    f"🔄 টাইম শেষে আবার শুরু হবে",
+                    reply_markup=markup,
+                    parse_mode='Markdown'
+                )
+                self.block_message_id = msg.message_id
+                self.block_chat_id = chat_id
+        except Exception as e:
+            logger.error(f"Error showing block timer: {e}")
+    
+    def update_block_timer(self):
+        """প্রতি মিনিটে টাইমার আপডেট করে"""
+        while self.is_blocked and self.is_running:
+            if self.block_end_time:
+                remaining = (self.block_end_time - datetime.now()).seconds
+                if remaining <= 0:
+                    # ব্লক শেষ
+                    self.is_blocked = False
+                    self.block_start_time = None
+                    self.block_end_time = None
+                    self.block_message_id = None
+                    
+                    # এডমিনকে জানাই
+                    self.notify_admin("✅ **১ ঘন্টা ব্লক শেষ**\nআবার OTP সেন্ডিং শুরু হচ্ছে...")
+                    
+                    # স্ট্যাটাস আপডেট
+                    if self.status_message:
+                        try:
+                            bot.edit_message_text(
+                                self.get_status_text(),
+                                self.current_chat_id,
+                                self.status_message.message_id
+                            )
+                        except:
+                            pass
+                    break
+                
+                # টাইমার আপডেট
+                self.show_block_timer(self.block_chat_id, remaining)
+            
+            time.sleep(1)  # ১ সেকেন্ড পর পর চেক
+    
+    def get_status_text(self):
+        """বর্তমান স্ট্যাটাস টেক্সট রিটার্ন করে"""
+        total_numbers = len(self.pending_numbers)
+        current = self.current_number_index % total_numbers if total_numbers > 0 else 0
+        phone = self.pending_numbers[current] if self.pending_numbers else "N/A"
+        
+        status = (
+            f"🚀 **OTP বট ২৪/৭ মোড**\n"
+            f"{'='*30}\n"
+            f"📊 মোট নাম্বার: {total_numbers}\n"
+            f"📱 বর্তমান: {phone}\n"
+            f"🔄 পজিশন: {current + 1}/{total_numbers}\n"
+            f"✅ মোট সফল: {self.stats['total_sent']}\n"
+            f"🔄 সাইকেল: {self.stats['total_cycles']}\n"
+        )
+        
+        if self.is_blocked:
+            remaining = (self.block_end_time - datetime.now()).seconds
+            minutes = remaining // 60
+            status += f"⏸️ **ব্লক**: {minutes} মিনিট বাকি\n"
+        
+        status += f"{'='*30}\n"
+        status += f"🛑 বন্ধ করতে /stop কমান্ড দিন"
+        
+        return status
+    
+    def update_status_message(self):
+        """স্ট্যাটাস মেসেজ আপডেট করে"""
+        if not self.status_message or not self.current_chat_id:
+            return
+        
+        try:
+            bot.edit_message_text(
+                self.get_status_text(),
+                self.current_chat_id,
+                self.status_message.message_id,
+                parse_mode='Markdown'
+            )
+        except Exception as e:
+            logger.error(f"Error updating status: {e}")
+    
+    def send_otp(self, phone_number, use_whatsapp=False):
+        """OTP পাঠায় - ব্লক হলে কিছু কাউন্ট করে না"""
+        
+        # ফরম্যাট ফোন নাম্বার
+        phone_number = self.format_phone_number(phone_number)
+        
+        # API কল
+        app_id, api_key = self.get_current_api()
+        
+        if not app_id or not api_key:
+            return False, "no_api"
+        
+        headers = {
+            "x-api-key": api_key,
+            "Content-Type": "application/json",
+            "Accept": "application/json"
+        }
+        
+        url = f"https://verification.didit.me/v3/phone/send/"
+        
+        payload = {
+            "phone_number": phone_number,
+            "application_id": app_id,
+            "options": {
+                "code_size": 6,
+                "locale": "en",
+                "preferred_channel": "whatsapp" if use_whatsapp else "sms"
+            }
+        }
+        
+        try:
+            logger.info(f"Sending OTP to {phone_number}")
+            response = requests.post(url, json=payload, headers=headers, timeout=30)
+            
+            # সফল
+            if response.status_code == 200:
+                data = response.json()
+                
+                # ব্লক চেক
+                if data.get('status') == 'Blocked' and data.get('reason') == 'suspicious':
+                    logger.warning(f"Block detected for {phone_number}")
+                    return False, "block"
+                
+                self.stats['total_sent'] += 1
+                return True, "success"
+            
+            # ক্রেডিট নেই - API সুইচ
+            elif response.status_code == 402 or "credits" in response.text.lower():
+                logger.warning("Insufficient credits! Switching API...")
+                self.switch_to_next_api()
+                return False, "retry"
+            
+            # ব্লক
+            elif response.status_code == 403:
+                try:
+                    error_data = response.json()
+                    if error_data.get('status') == 'Blocked' and error_data.get('reason') == 'suspicious':
+                        logger.warning(f"Block detected for {phone_number}")
+                        return False, "block"
+                except:
+                    pass
+                
+                # API সুইচ
+                self.switch_to_next_api()
+                return False, "retry"
+            
+            # অন্য এরর
+            else:
+                logger.error(f"Error {response.status_code}")
+                return False, "error"
+                
+        except Exception as e:
+            logger.error(f"Exception: {str(e)}")
+            return False, "error"
+    
+    def start_24x7_processing(self, file_path, use_whatsapp, chat_id):
+        """২৪/৭ প্রসেসিং শুরু করে - ব্লক হলে টাইমার দেখায়"""
+        try:
+            with open(file_path, "r", encoding="utf-8") as f:
+                self.pending_numbers = [line.strip() for line in f if line.strip()]
+            
+            if not self.pending_numbers:
+                bot.send_message(chat_id, "❌ ফাইলটি খালি!")
+                return
+            
+            # ইনিশিয়ালাইজ
+            self.use_whatsapp = use_whatsapp
+            self.current_chat_id = chat_id
+            self.file_path = file_path
+            self.is_running = True
+            self.stop_requested = False
+            self.is_blocked = False
+            self.current_number_index = 0
+            self.stats['start_time'] = datetime.now()
+            self.stats['total_cycles'] = 0
+            
+            # স্ট্যাটাস মেসেজ
+            self.status_message = bot.send_message(
+                chat_id,
+                self.get_status_text(),
+                parse_mode='Markdown'
+            )
+            
+            # এডমিনকে জানাই
+            self.notify_admin(
+                f"🚀 **২৪/৭ মোড শুরু**\n"
+                f"📊 মোট নাম্বার: {len(self.pending_numbers)}\n"
+                f"📱 চ্যানেল: {'WhatsApp' if use_whatsapp else 'SMS'}\n"
+                f"⏸️ ব্লক হলে ১ ঘন্টা টাইমার"
+            )
+            
+            # মেইন লুপ
+            while self.is_running and not self.stop_requested:
+                
+                # ব্লক চেক
+                if self.is_blocked:
+                    # ব্লক থাকলে - কিছু করব না, টাইমার চলবে
+                    time.sleep(1)
+                    continue
+                
+                # বর্তমান নাম্বার
+                current_phone = self.pending_numbers[self.current_number_index]
+                
+                # OTP পাঠাই
+                success, status = self.send_otp(current_phone, use_whatsapp)
+                
+                if success:
+                    # সফল - পরবর্তী নাম্বার
+                    logger.info(f"✅ Success: {current_phone}")
+                    self.current_number_index = (self.current_number_index + 1) % len(self.pending_numbers)
+                    self.update_status_message()
+                    
+                elif status == "block":
+                    # ব্লক - টাইমার শুরু
+                    logger.warning(f"🚫 Block detected! Starting 1 hour timer")
+                    
+                    self.is_blocked = True
+                    self.block_start_time = datetime.now()
+                    self.block_end_time = self.block_start_time + timedelta(hours=1)
+                    
+                    # টাইমার বাটন দেখাই
+                    self.show_block_timer(chat_id, 3600)
+                    
+                    # এডমিনকে জানাই
+                    self.notify_admin(
+                        f"🚫 **ব্লক detected**\n"
+                        f"📱 নাম্বার: {current_phone}\n"
+                        f"⏰ ১ ঘন্টার টাইমার শুরু\n"
+                        f"⏱️ শেষ হবে: {self.block_end_time.strftime('%H:%M:%S')}"
+                    )
+                    
+                    # টাইমার থ্রেড শুরু
+                    timer_thread = threading.Thread(target=self.update_block_timer)
+                    timer_thread.daemon = True
+                    timer_thread.start()
+                
+                elif status == "retry":
+                    # রিট্রাই - একই নাম্বার আবার
+                    logger.info(f"Retry {current_phone}")
+                    time.sleep(2)
+                    continue
+                
+                else:
+                    # অন্য এরর - পরবর্তী নাম্বার
+                    logger.error(f"Error on {current_phone}")
+                    self.current_number_index = (self.current_number_index + 1) % len(self.pending_numbers)
+                    self.update_status_message()
+                
+                # রেট লিমিট
+                if not self.is_blocked:
+                    time.sleep(self.rate_limit_wait)
+                    
+                    # সাইকেল কাউন্ট
+                    if self.current_number_index == 0:
+                        self.stats['total_cycles'] += 1
+                        self.update_status_message()
+            
+            # স্টপ করা হয়েছে
+            if self.stop_requested:
+                bot.send_message(
+                    chat_id,
+                    f"🛑 **প্রসেসিং বন্ধ করা হয়েছে**\n"
+                    f"✅ মোট সফল: {self.stats['total_sent']}\n"
+                    f"🔄 মোট সাইকেল: {self.stats['total_cycles']}"
+                )
+            
+        except Exception as e:
+            bot.send_message(chat_id, f"❌ এরর: {str(e)}")
+        finally:
+            self.is_running = False
+            self.stop_requested = False
+            self.is_blocked = False
+            self.status_message = None
+            self.block_message_id = None
+    
+    def stop_processing(self):
+        """প্রসেসিং বন্ধ করে"""
+        if self.is_running:
+            self.stop_requested = True
+            self.notify_admin("🛑 প্রসেসিং বন্ধ করা হচ্ছে...")
+            return True
+        return False
+
+# টেলিগ্রাম কমান্ড হ্যান্ডলার
+@bot.message_handler(commands=['start'])
+def start_command(message):
+    if message.from_user.id != ADMIN_ID:
+        bot.reply_to(message, "❌ আপনি অ্যাডমিন নন!")
+        return
+    
+    markup = InlineKeyboardMarkup(row_width=2)
+    markup.add(
+        InlineKeyboardButton("📊 স্ট্যাটাস", callback_data="status"),
+        InlineKeyboardButton("🔑 API Keys", callback_data="list_apis"),
+        InlineKeyboardButton("📁 ফাইল আপলোড", callback_data="send_file"),
+        InlineKeyboardButton("⚙️ সেটিংস", callback_data="settings"),
+        InlineKeyboardButton("🛑 স্টপ", callback_data="stop_task")
+    )
+    
+    bot.send_message(
+        message.chat.id,
+        "🤖 **OTP বট v6.0 - ২৪/৭ টাইমার মোড**\n\n"
+        "**বৈশিষ্ট্য:**\n"
+        "• ব্লক হলে ১ ঘন্টার টাইমার বাটন দেখাবে\n"
+        "• টাইমার চলাকালে কোন API কল হবে না\n"
+        "• টাইমার শেষে আবার শুরু হবে\n"
+        "• কোন কিছু কাউন্ট হবে না (শুধু সফল)\n\n"
+        "নিচের বাটন ব্যবহার করুন:",
+        reply_markup=markup,
+        parse_mode='Markdown'
+    )
+
+@bot.message_handler(commands=['stop'])
+def stop_command(message):
+    if message.from_user.id != ADMIN_ID:
+        return
+    
+    if otp_bot.stop_processing():
+        bot.reply_to(message, "🛑 প্রসেসিং বন্ধ করা হচ্ছে...")
+    else:
+        bot.reply_to(message, "❌ কোন প্রসেসিং চলছে না!")
+
+@bot.message_handler(commands=['status'])
+def status_command(message):
+    if message.from_user.id != ADMIN_ID:
+        return
+    
+    if otp_bot.is_running:
+        bot.send_message(
+            message.chat.id,
+            otp_bot.get_status_text(),
+            parse_mode='Markdown'
+        )
+    else:
+        bot.send_message(message.chat.id, "⏸️ কোন প্রসেস চলছে না")
+
+@bot.message_handler(commands=['add_api'])
+def add_api_command(message):
+    if message.from_user.id != ADMIN_ID:
+        return
+    
+    try:
+        parts = message.text.split()
+        if len(parts) == 3:
+            app_id = parts[1]
+            api_key = parts[2]
+            success, msg = otp_bot.add_api_key(app_id, api_key, message.from_user.id)
+            bot.reply_to(message, msg)
+        else:
+            bot.reply_to(message, "❌ ব্যবহার: /add_api APP_ID API_KEY")
+    except Exception as e:
+        bot.reply_to(message, f"❌ এরর: {str(e)}")
+
+@bot.message_handler(commands=['remove_api'])
+def remove_api_command(message):
+    if message.from_user.id != ADMIN_ID:
+        return
+    
+    try:
+        index = int(message.text.split()[1]) - 1
+        success, msg = otp_bot.remove_api_key(index)
+        bot.reply_to(message, msg)
+    except:
+        bot.reply_to(message, "❌ ব্যবহার: /remove_api INDEX_NUMBER")
+
+@bot.message_handler(content_types=['document'])
+def handle_document(message):
+    if message.from_user.id != ADMIN_ID:
+        return
+    
+    if otp_bot.is_running:
+        bot.reply_to(message, "❌ আগের টাস্ক চলছে! /stop দিয়ে বন্ধ করুন")
+        return
+    
+    try:
+        file_info = bot.get_file(message.document.file_id)
+        downloaded_file = bot.download_file(file_info.file_path)
+        
+        file_path = f"24x7_{message.document.file_name}"
+        with open(file_path, 'wb') as f:
+            f.write(downloaded_file)
+        
+        markup = InlineKeyboardMarkup(row_width=2)
+        markup.add(
+            InlineKeyboardButton("📱 SMS (২৪/৭)", callback_data=f"start_sms_{file_path}"),
+            InlineKeyboardButton("💬 WhatsApp (২৪/৭)", callback_data=f"start_wa_{file_path}")
+        )
+        
+        bot.reply_to(
+            message, 
+            f"✅ ফাইল পাওয়া গেছে: {message.document.file_name}\n"
+            f"📊 মোট নাম্বার: {len(open(file_path).readlines())}\n\n"
+            "**২৪/৭ টাইমার মোড:**\n"
+            "• ব্লক হলে টাইমার বাটন দেখাবে\n"
+            "• টাইমার শেষে আবার শুরু\n"
+            "• কোন কিছু কাউন্ট হবে না",
+            reply_markup=markup,
+            parse_mode='Markdown'
+        )
+        
+    except Exception as e:
+        bot.reply_to(message, f"❌ এরর: {str(e)}")
+
+@bot.callback_query_handler(func=lambda call: True)
+def callback_handler(call):
+    if call.from_user.id != ADMIN_ID:
+        return
+    
+    if call.data == "status":
+        if otp_bot.is_running:
+            bot.send_message(
+                call.message.chat.id,
+                otp_bot.get_status_text(),
+                parse_mode='Markdown'
+            )
+        else:
+            bot.answer_callback_query(call.id, "⏸️ কোন প্রসেস চলছে না")
+    
+    elif call.data == "list_apis":
+        show_api_list(call.message.chat.id)
+    
+    elif call.data == "send_file":
+        bot.send_message(
+            call.message.chat.id,
+            "📁 যেকোনো টেক্সট ফাইল আপলোড করুন\n"
+            "ফরম্যাট: প্রতিটি লাইনে এক একটি নাম্বার\n\n"
+            "⚠️ **২৪/৭ টাইমার মোড:**\n"
+            "• ব্লক হলে ১ ঘন্টা টাইমার\n"
+            "• টাইমার শেষে আবার শুরু\n"
+            "• স্টপ না দেওয়া পর্যন্ত চলবে",
+            parse_mode='Markdown'
+        )
+    
+    elif call.data == "settings":
+        show_settings(call.message.chat.id)
+    
+    elif call.data == "stop_task":
+        if otp_bot.stop_processing():
+            bot.answer_callback_query(call.id, "🛑 বন্ধ করা হচ্ছে...")
+            bot.send_message(call.message.chat.id, "🛑 প্রসেসিং বন্ধ করা হচ্ছে...")
+        else:
+            bot.answer_callback_query(call.id, "❌ কোন টাস্ক চলছে না")
+    
+    elif call.data == "block_timer":
+        bot.answer_callback_query(call.id, "⏳ টাইমার চলছে... ১ ঘন্টা পর আবার শুরু হবে")
+    
+    elif call.data.startswith("start_"):
+        parts = call.data.split('_')
+        channel = parts[1]
+        file_path = '_'.join(parts[2:])
+        
+        use_whatsapp = (channel == "wa")
+        
+        if not otp_bot.is_running:
+            otp_bot.is_running = True
+            thread = threading.Thread(
+                target=otp_bot.start_24x7_processing,
+                args=(file_path, use_whatsapp, call.message.chat.id)
+            )
+            thread.daemon = True
+            thread.start()
+            bot.answer_callback_query(call.id, "🚀 ২৪/৭ টাইমার মোড শুরু হচ্ছে...")
+        else:
+            bot.answer_callback_query(call.id, "❌ আগের টাস্ক চলছে!")
+
+def show_api_list(chat_id):
+    """Show API keys list"""
+    if not otp_bot.api_keys:
+        bot.send_message(chat_id, "❌ কোন API key নেই!\n/add_api কমান্ড ব্যবহার করুন")
+        return
+    
+    text = "🔑 **API Keys লিস্ট:**\n\n"
+    for i, key in enumerate(otp_bot.api_keys, 1):
+        status = "✅" if key.get('is_active', True) else "❌"
+        errors = key.get('error_count', 0)
+        text += f"{status} {i}. {key['app_id'][:8]}...\n"
+        text += f"   ├ Errors: {errors}\n"
+        text += f"   └ Added: {key['added_on'][:10]}\n"
+    
+    text += f"\nমোট: {len(otp_bot.api_keys)} টি"
+    bot.send_message(chat_id, text)
+
+def show_settings(chat_id):
+    """Show settings"""
+    markup = InlineKeyboardMarkup(row_width=2)
+    markup.add(
+        InlineKeyboardButton("⏱️ Delay: 3s", callback_data="delay_3"),
+        InlineKeyboardButton("⏱️ Delay: 5s", callback_data="delay_5"),
+        InlineKeyboardButton("⏱️ Delay: 10s", callback_data="delay_10")
+    )
+    
+    bot.send_message(
+        chat_id,
+        f"⚙️ **সেটিংস**\n\n"
+        f"বর্তমান Delay: {otp_bot.rate_limit_wait} সেকেন্ড",
+        reply_markup=markup,
+        parse_mode='Markdown'
+    )
+
+# মেইন এক্সিকিউশন
+if __name__ == "__main__":
+    print("""
+    ╔══════════════════════════════════╗
+    ║     TELEGRAM OTP BOT v6.0        ║
+    ║      ২৪/৭ টাইমার মোড             ║
+    ╚══════════════════════════════════╝
+    """)
+    
+    print("⚡ ফিচারসমূহ:")
+    print("• ব্লক হলে ১ ঘন্টা টাইমার বাটন")
+    print("• টাইমার শেষে আবার শুরু")
+    print("• কোন কিছু কাউন্ট হয় না")
+    print("• ২৪/৭ চলতে থাকবে")
+    
+    otp_bot = OTPBot()
+    
+    try:
+        bot.send_message(ADMIN_ID, "🤖 **OTP বট v6.0 - ২৪/৭ টাইমার মোড** চালু হয়েছে!\n\n/start কমান্ড দিন")
+    except:
+        print("⚠️ Admin notification failed")
+    
+    print("\n✅ Telegram bot is running in 24/7 timer mode...")
+    print("📌 Commands: /start, /stop, /status, /add_api, /remove_api")
+    bot.infinity_polling()            if key['app_id'] == app_id and key['api_key'] == api_key:
                 return False, "এই API key আগেই যোগ করা আছে!"
         
         new_key = {
