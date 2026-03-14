@@ -24,9 +24,13 @@ class OTPBot:
         self.api_keys = []
         self.current_api_index = 0
         self.blocked_until = {}
+        self.blocked_numbers_file = "blocked_numbers.json"
         self.rate_limit_wait = 3
         self.config_file = "config.json"
         self.is_running = False
+        self.stop_requested = False
+        self.paused_until = None  # কখন পর্যন্ত পজ করা আছে
+        self.pause_reason = None  # পজের কারণ
         self.current_task = None
         self.stats = {
             'total_sent': 0,
@@ -34,6 +38,12 @@ class OTPBot:
             'total_blocked': 0,
             'start_time': None
         }
+        self.pending_numbers = []
+        self.current_processing_index = 0
+        self.use_whatsapp = False
+        self.current_chat_id = None
+        self.current_message_id = None
+        self.status_message = None
         self.load_config()
         self.load_blocked_numbers()
         
@@ -65,7 +75,6 @@ class OTPBot:
     
     def add_api_key(self, app_id, api_key, user_id=None):
         """Add new API key to the pool"""
-        # Check if already exists
         for key in self.api_keys:
             if key['app_id'] == app_id and key['api_key'] == api_key:
                 return False, "এই API key আগেই যোগ করা আছে!"
@@ -96,7 +105,6 @@ class OTPBot:
         if not self.api_keys:
             return None, None
         
-        # Try to find an active key
         for i in range(len(self.api_keys)):
             idx = (self.current_api_index + i) % len(self.api_keys)
             if self.api_keys[idx].get('is_active', True):
@@ -110,17 +118,14 @@ class OTPBot:
         if not self.api_keys:
             return False
         
-        # Mark current as problematic if not already
         if self.current_api_index < len(self.api_keys):
             self.api_keys[self.current_api_index]['error_count'] = self.api_keys[self.current_api_index].get('error_count', 0) + 1
             
-            # Deactivate if too many errors
             if self.api_keys[self.current_api_index]['error_count'] >= 3:
                 self.api_keys[self.current_api_index]['is_active'] = False
                 logger.warning(f"API key {self.current_api_index + 1} deactivated due to multiple errors")
                 self.notify_admin(f"⚠️ API key {self.current_api_index + 1} ডিঅ্যাক্টিভ করা হয়েছে\nকারণ: ৩ বার ত্রুটি")
         
-        # Find next active key
         start_idx = (self.current_api_index + 1) % len(self.api_keys)
         for i in range(len(self.api_keys)):
             idx = (start_idx + i) % len(self.api_keys)
@@ -147,8 +152,9 @@ class OTPBot:
                 wait_time = (self.blocked_until[phone_number] - datetime.now()).seconds // 60
                 return True, wait_time
             else:
-                # Block time expired
                 del self.blocked_until[phone_number]
+                self.save_blocked_numbers()
+                logger.info(f"Number {phone_number} automatically unblocked after 1 hour")
         return False, 0
     
     def block_number(self, phone_number):
@@ -158,8 +164,9 @@ class OTPBot:
         self.stats['total_blocked'] += 1
         logger.info(f"Blocked {phone_number} until {block_until.strftime('%H:%M:%S')}")
         
-        # Save blocked status
         self.save_blocked_numbers()
+        self.notify_admin(f"🚫 নাম্বার ব্লক: {phone_number}\n📅 আনব্লক হবে: {block_until.strftime('%H:%M:%S')}")
+        
         return block_until
     
     def save_blocked_numbers(self):
@@ -169,43 +176,99 @@ class OTPBot:
             blocked_data[num] = until.isoformat()
         
         try:
-            with open('blocked_numbers.json', 'w') as f:
+            with open(self.blocked_numbers_file, 'w') as f:
                 json.dump(blocked_data, f, indent=2)
         except Exception as e:
             logger.error(f"Error saving blocked numbers: {e}")
     
     def load_blocked_numbers(self):
         """Load blocked numbers from file"""
-        if os.path.exists('blocked_numbers.json'):
+        if os.path.exists(self.blocked_numbers_file):
             try:
-                with open('blocked_numbers.json', 'r') as f:
+                with open(self.blocked_numbers_file, 'r') as f:
                     data = json.load(f)
+                    current_time = datetime.now()
                     for num, until_str in data.items():
                         until = datetime.fromisoformat(until_str)
-                        if datetime.now() < until:
+                        if current_time < until:
                             self.blocked_until[num] = until
+                        else:
+                            logger.info(f"Number {num} already unblocked (expired)")
                 logger.info(f"Loaded {len(self.blocked_until)} blocked numbers")
             except Exception as e:
                 logger.error(f"Error loading blocked numbers: {e}")
     
+    def check_and_unblock_numbers(self):
+        """Check and unblock expired numbers"""
+        current_time = datetime.now()
+        unblocked = []
+        
+        for number, block_until in list(self.blocked_until.items()):
+            if current_time >= block_until:
+                del self.blocked_until[number]
+                unblocked.append(number)
+                logger.info(f"Number {number} automatically unblocked")
+        
+        if unblocked:
+            self.save_blocked_numbers()
+            self.notify_admin(f"✅ {len(unblocked)} টি নাম্বার আনব্লক করা হয়েছে")
+        
+        return unblocked
+    
+    def update_status_message(self, success, failed, blocked, skipped, status_text=""):
+        """Update the status message in Telegram"""
+        if not self.status_message or not self.current_chat_id:
+            return
+        
+        try:
+            total = len(self.pending_numbers)
+            current = self.current_processing_index
+            progress = (current / total) * 100 if total > 0 else 0
+            
+            # পজ স্ট্যাটাস চেক
+            pause_status = ""
+            if self.paused_until:
+                remaining = (self.paused_until - datetime.now()).seconds // 60
+                pause_status = f"\n⏸️ **পজ করা আছে** - আর {remaining} মিনিট\nকারণ: {self.pause_reason}"
+            
+            message_text = (
+                f"🚀 **OTP পাঠানো চলছে...**\n"
+                f"📊 অগ্রগতি: {current}/{total} ({progress:.1f}%)\n"
+                f"├ ✅ সফল: {success}\n"
+                f"├ ❌ ব্যর্থ: {failed}\n"
+                f"├ 🚫 ব্লক: {blocked}\n"
+                f"├ ⏸️ স্কিপ: {skipped}\n"
+                f"└ ⏱️ চালু আছে...\n"
+                f"{pause_status}\n"
+                f"{status_text}"
+            )
+            
+            bot.edit_message_text(
+                message_text,
+                self.current_chat_id,
+                self.status_message.message_id,
+                parse_mode='Markdown'
+            )
+        except Exception as e:
+            logger.error(f"Error updating status: {e}")
+    
     def send_otp(self, phone_number, use_whatsapp=False, max_retries=3):
         """Send OTP with automatic API switching and block handling"""
         
-        # Check if number is blocked
+        # চেক করি নাম্বার ব্লক কিনা
         is_blocked, wait_time = self.is_number_blocked(phone_number)
         if is_blocked:
-            return False, f"ব্লক করা আছে। আর {wait_time} মিনিট বাকি"
+            return False, f"ব্লক", f"ব্লক করা আছে। আর {wait_time} মিনিট বাকি"
         
-        # Format phone number
+        # ফরম্যাট ফোন নাম্বার
         if not phone_number.startswith('+'):
             phone_number = '+' + phone_number.lstrip('0')
         
         for attempt in range(max_retries):
-            # Get current API credentials
             app_id, api_key = self.get_current_api()
             
             if not app_id or not api_key:
-                return False, "❌ কোনো API key নেই!"
+                return False, "error", "❌ কোনো API key নেই!"
             
             headers = {
                 "x-api-key": api_key,
@@ -229,50 +292,51 @@ class OTPBot:
                 logger.info(f"Sending to {phone_number} (Attempt {attempt + 1}/{max_retries})")
                 response = requests.post(url, json=payload, headers=headers, timeout=30)
                 
-                # Update last used time
                 if self.current_api_index < len(self.api_keys):
                     self.api_keys[self.current_api_index]['last_used'] = datetime.now().isoformat()
                 
-                # Check response
+                # সফল
                 if response.status_code == 200:
                     data = response.json()
                     
-                    # Check for blocked status in response
                     if data.get('status') == 'Blocked' and data.get('reason') == 'suspicious':
-                        block_until = self.block_number(phone_number)
-                        return False, f"🚫 সন্দেহজনক! ১ ঘন্টার জন্য ব্লক"
+                        self.block_number(phone_number)
+                        return False, "block", f"🚫 সন্দেহজনক! ১ ঘন্টার জন্য ব্লক"
                     
                     self.stats['total_sent'] += 1
-                    return True, "✅ OTP পাঠানো হয়েছে"
-                    
+                    return True, "success", "✅ OTP পাঠানো হয়েছে"
+                
+                # ক্রেডিট নেই
                 elif response.status_code == 402 or "credits" in response.text.lower():
                     logger.warning("Insufficient credits! Switching API key...")
                     if self.switch_to_next_api():
                         continue
                     else:
-                        return False, "❌ কোনো API key তে ক্রেডিট নেই!"
-                        
+                        return False, "error", "❌ কোনো API key তে ক্রেডিট নেই!"
+                
+                # ব্লক বা এক্সেস সমস্যা
                 elif response.status_code == 403:
                     try:
                         error_data = response.json()
                         if error_data.get('status') == 'Blocked' and error_data.get('reason') == 'suspicious':
                             self.block_number(phone_number)
-                            return False, "🚫 সন্দেহজনক! ১ ঘন্টার জন্য ব্লক"
+                            return False, "block", f"🚫 সন্দেহজনক! ১ ঘন্টার জন্য ব্লক"
                     except:
                         pass
                     
                     if self.switch_to_next_api():
                         continue
                     else:
-                        return False, "❌ এক্সেস নাই!"
-                        
+                        return False, "error", "❌ এক্সেস নাই!"
+                
+                # অন্য ত্রুটি
                 else:
                     logger.error(f"Error {response.status_code}")
                     try:
                         error_data = response.json()
                         if error_data.get('status') == 'Blocked' and error_data.get('reason') == 'suspicious':
                             self.block_number(phone_number)
-                            return False, "🚫 সন্দেহজনক! ১ ঘন্টার জন্য ব্লक"
+                            return False, "block", f"🚫 সন্দেহজনক! ১ ঘন্টার জন্য ব্লক"
                     except:
                         pass
                     
@@ -282,7 +346,7 @@ class OTPBot:
                             continue
                     
                     self.stats['total_failed'] += 1
-                    return False, f"❌ ত্রুটি: {response.status_code}"
+                    return False, "error", f"❌ ত্রুটি: {response.status_code}"
                     
             except Exception as e:
                 logger.error(f"Error: {str(e)}")
@@ -290,25 +354,33 @@ class OTPBot:
                     time.sleep(2)
                     continue
                 self.stats['total_failed'] += 1
-                return False, f"❌ এরর: {str(e)[:50]}"
+                return False, "error", f"❌ এরর: {str(e)[:50]}"
         
-        return False, "❌ সর্বোচ্চ চেষ্টা ব্যর্থ"
+        return False, "error", "❌ সর্বোচ্চ চেষ্টা ব্যর্থ"
     
     def process_file(self, file_path, use_whatsapp, chat_id, message_id=None):
-        """Process phone numbers from file"""
+        """Process phone numbers from file - ব্লক হলে ১ ঘন্টা পজ, তারপর আবার শুরু"""
         try:
             with open(file_path, "r", encoding="utf-8") as f:
-                phone_numbers = [line.strip() for line in f if line.strip()]
+                self.pending_numbers = [line.strip() for line in f if line.strip()]
             
-            if not phone_numbers:
+            if not self.pending_numbers:
                 bot.send_message(chat_id, "❌ ফাইলটি খালি!")
                 return
             
-            # Send initial status
-            status_msg = bot.send_message(chat_id, 
+            # সেভ করা
+            self.use_whatsapp = use_whatsapp
+            self.current_chat_id = chat_id
+            self.stop_requested = False
+            self.paused_until = None
+            self.pause_reason = None
+            
+            # স্ট্যাটাস মেসেজ
+            self.status_message = bot.send_message(chat_id, 
                 f"🚀 OTP পাঠানো শুরু...\n"
-                f"📊 মোট নাম্বার: {len(phone_numbers)}\n"
-                f"📱 চ্যানেল: {'WhatsApp' if use_whatsapp else 'SMS'}")
+                f"📊 মোট নাম্বার: {len(self.pending_numbers)}\n"
+                f"📱 চ্যানেল: {'WhatsApp' if use_whatsapp else 'SMS'}\n"
+                f"⏸️ ব্লক হলে ১ ঘন্টা পজ হবে, তারপর আবার শুরু")
             
             success = 0
             failed = 0
@@ -316,65 +388,142 @@ class OTPBot:
             skipped = 0
             
             self.stats['start_time'] = datetime.now()
+            self.current_processing_index = 0
             
-            for i, phone in enumerate(phone_numbers, 1):
-                # Check if number is blocked
+            i = 0
+            while i < len(self.pending_numbers) and not self.stop_requested:
+                # চেক করি পজ করা আছে কিনা
+                if self.paused_until:
+                    if datetime.now() < self.paused_until:
+                        # পজ অবস্থায় আছি
+                        remaining = (self.paused_until - datetime.now()).seconds
+                        wait_time = min(remaining, 60)  # সর্বোচ্চ ৬০ সেকেন্ড wait
+                        
+                        # স্ট্যাটাস আপডেট
+                        self.update_status_message(
+                            success, failed, blocked, skipped,
+                            f"⏸️ পজ: {remaining//60} মিনিট বাকি..."
+                        )
+                        
+                        time.sleep(wait_time)
+                        continue
+                    else:
+                        # পজ শেষ, আবার শুরু
+                        self.paused_until = None
+                        self.pause_reason = None
+                        self.notify_admin("▶️ ১ ঘন্টা পজ শেষ, আবার OTP পাঠানো শুরু হচ্ছে...")
+                        
+                        # স্ট্যাটাস আপডেট
+                        self.update_status_message(
+                            success, failed, blocked, skipped,
+                            "▶️ পজ শেষ, আবার শুরু..."
+                        )
+                
+                phone = self.pending_numbers[i]
+                
+                # চেক করি নাম্বার ব্লক কিনা
                 is_blocked, wait_time = self.is_number_blocked(phone)
                 if is_blocked:
                     skipped += 1
+                    i += 1
                     continue
                 
-                # Send OTP
-                result, message = self.send_otp(phone, use_whatsapp)
+                # OTP পাঠাই
+                result, result_type, message = self.send_otp(phone, use_whatsapp)
                 
                 if result:
                     success += 1
                 else:
-                    if "ব্লক" in message or "সন্দেহজনক" in message:
+                    if result_type == "block":
                         blocked += 1
+                        # ব্লক হলে পুরো প্রসেস ১ ঘন্টা পজ
+                        self.paused_until = datetime.now() + timedelta(hours=1)
+                        self.pause_reason = f"নাম্বার ব্লক: {phone}"
+                        
+                        # এডমিনকে জানাই
+                        self.notify_admin(
+                            f"🚫 **পুরো প্রসেস ১ ঘন্টা পজ**\n"
+                            f"কারণ: {phone} ব্লক হয়েছে\n"
+                            f"পজ শেষ: {(datetime.now() + timedelta(hours=1)).strftime('%H:%M:%S')}"
+                        )
+                        
+                        # স্ট্যাটাস আপডেট
+                        self.update_status_message(
+                            success, failed, blocked, skipped,
+                            f"🚫 ব্লক! ১ ঘন্টা পজ..."
+                        )
+                        
+                        # পজ শেষ না হওয়া পর্যন্ত wait করব না, লুপের শুরুতে চেক করবে
+                        continue
                     else:
                         failed += 1
                 
-                # Update status every 5 numbers
-                if i % 5 == 0 or i == len(phone_numbers):
-                    progress = (i / len(phone_numbers)) * 100
-                    try:
-                        bot.edit_message_text(
-                            f"🚀 অগ্রগতি: {i}/{len(phone_numbers)} ({progress:.1f}%)\n"
-                            f"✅ সফল: {success}\n"
-                            f"❌ ব্যর্থ: {failed}\n"
-                            f"🚫 ব্লক: {blocked}\n"
-                            f"⏸️ স্কিপ: {skipped}\n"
-                            f"⏱️ চালু আছে...",
-                            chat_id, status_msg.message_id
-                        )
-                    except:
-                        pass
+                i += 1
+                self.current_processing_index = i
                 
-                # Rate limiting
-                if i < len(phone_numbers):
+                # প্রতি ৫টা নাম্বারে স্ট্যাটাস আপডেট
+                if i % 5 == 0 or i == len(self.pending_numbers):
+                    self.update_status_message(success, failed, blocked, skipped)
+                
+                # রেট লিমিট
+                if i < len(self.pending_numbers) and not self.paused_until:
                     time.sleep(self.rate_limit_wait)
             
-            # Final report
+            # ফাইনাল রিপোর্ট
             time_taken = (datetime.now() - self.stats['start_time']).seconds
             report = (
-                f"✅ **কাজ শেষ!**\n\n"
+                f"{'🛑 **স্টপ করা হয়েছে**' if self.stop_requested else '✅ **কাজ শেষ!**'}\n\n"
                 f"📊 **রিপোর্ট:**\n"
-                f"├ মোট নাম্বার: {len(phone_numbers)}\n"
+                f"├ মোট নাম্বার: {len(self.pending_numbers)}\n"
                 f"├ ✅ সফল: {success}\n"
                 f"├ ❌ ব্যর্থ: {failed}\n"
                 f"├ 🚫 ব্লক: {blocked}\n"
                 f"├ ⏸️ স্কিপ: {skipped}\n"
+                f"├ প্রসেসড: {i}\n"
                 f"└ ⏱️ সময়: {time_taken} সেকেন্ড\n\n"
                 f"📱 চ্যানেল: {'WhatsApp' if use_whatsapp else 'SMS'}"
             )
             
             bot.send_message(chat_id, report, parse_mode='Markdown')
             
+            # বাকি নাম্বার থাকলে নোটিফাই
+            remaining = len(self.pending_numbers) - i
+            if remaining > 0 and self.stop_requested:
+                bot.send_message(chat_id, f"⏸️ {remaining} টি নাম্বার বাকি আছে")
+            
         except Exception as e:
             bot.send_message(chat_id, f"❌ এরর: {str(e)}")
         finally:
             self.is_running = False
+            self.stop_requested = False
+            self.paused_until = None
+            self.pending_numbers = []
+            self.status_message = None
+            
+            try:
+                os.remove(file_path)
+            except:
+                pass
+
+    def stop_processing(self):
+        """Stop current processing gracefully"""
+        if self.is_running:
+            self.stop_requested = True
+            self.notify_admin("🛑 প্রসেসিং বন্ধ করা হচ্ছে...")
+            return True
+        return False
+
+    def get_status(self):
+        """Get current processing status"""
+        if not self.is_running:
+            return "⏸️ কোন প্রসেস চলছে না"
+        
+        status = f"চলছে: {self.current_processing_index}/{len(self.pending_numbers)}"
+        if self.paused_until:
+            remaining = (self.paused_until - datetime.now()).seconds // 60
+            status += f"\n⏸️ পজ: {remaining} মিনিট বাকি\nকারণ: {self.pause_reason}"
+        
+        return status
 
 # টেলিগ্রাম কমান্ড হ্যান্ডলার
 @bot.message_handler(commands=['start'])
@@ -395,11 +544,31 @@ def start_command(message):
     
     bot.send_message(
         message.chat.id,
-        "🤖 **OTP বট কন্ট্রোল প্যানেল**\n\n"
+        "🤖 **OTP বট v4.0 - অটো রিজিউম**\n\n"
+        "বৈশিষ্ট্য:\n"
+        "• কোন নাম্বার ব্লক হলে ১ ঘন্টা পজ\n"
+        "• ১ ঘন্টা পর আবার শুরু\n"
+        "• স্টপ কমান্ড না দেওয়া পর্যন্ত চলবে\n\n"
         "নিচের বাটন ব্যবহার করুন:",
         reply_markup=markup,
         parse_mode='Markdown'
     )
+
+@bot.message_handler(commands=['stop'])
+def stop_command(message):
+    if message.from_user.id != ADMIN_ID:
+        return
+    
+    if otp_bot.stop_processing():
+        bot.reply_to(message, "🛑 প্রসেসিং বন্ধ করা হচ্ছে...")
+    else:
+        bot.reply_to(message, "❌ কোন প্রসেসিং চলছে না!")
+
+@bot.message_handler(commands=['status'])
+def status_command(message):
+    if message.from_user.id != ADMIN_ID:
+        return
+    show_status(message.chat.id)
 
 @bot.message_handler(commands=['add_api'])
 def add_api_command(message):
@@ -430,12 +599,6 @@ def remove_api_command(message):
     except:
         bot.reply_to(message, "❌ ব্যবহার: /remove_api INDEX_NUMBER")
 
-@bot.message_handler(commands=['status'])
-def status_command(message):
-    if message.from_user.id != ADMIN_ID:
-        return
-    show_status(message.chat.id)
-
 @bot.message_handler(content_types=['document'])
 def handle_document(message):
     if message.from_user.id != ADMIN_ID:
@@ -446,16 +609,13 @@ def handle_document(message):
         return
     
     try:
-        # Download file
         file_info = bot.get_file(message.document.file_id)
         downloaded_file = bot.download_file(file_info.file_path)
         
-        # Save file
         file_path = f"telegram_{message.document.file_name}"
         with open(file_path, 'wb') as f:
             f.write(downloaded_file)
         
-        # Ask for channel
         markup = InlineKeyboardMarkup(row_width=2)
         markup.add(
             InlineKeyboardButton("📱 SMS", callback_data=f"channel_sms_{file_path}"),
@@ -487,7 +647,11 @@ def callback_handler(call):
         bot.send_message(
             call.message.chat.id,
             "📁 যেকোনো টেক্সট ফাইল আপলোড করুন\n"
-            "ফরম্যাট: প্রতিটি লাইনে এক একটি নাম্বার"
+            "ফরম্যাট: প্রতিটি লাইনে এক একটি নাম্বার\n\n"
+            "⚠️ নোট:\n"
+            "• কোন নাম্বার ব্লক হলে ১ ঘন্টা পজ\n"
+            "• ১ ঘন্টা পর আবার শুরু\n"
+            "• স্টপ করতে /stop কমান্ড দিন"
         )
     
     elif call.data == "blocked_list":
@@ -497,10 +661,8 @@ def callback_handler(call):
         show_settings(call.message.chat.id)
     
     elif call.data == "stop_task":
-        if otp_bot.is_running:
-            otp_bot.is_running = False
-            bot.answer_callback_query(call.id, "✅ টাস্ক বন্ধ করা হয়েছে")
-            bot.send_message(call.message.chat.id, "🛑 টাস্ক বন্ধ করা হয়েছে")
+        if otp_bot.stop_processing():
+            bot.answer_callback_query(call.id, "🛑 বন্ধ করা হচ্ছে...")
         else:
             bot.answer_callback_query(call.id, "❌ কোন টাস্ক চলছে না")
     
@@ -524,6 +686,9 @@ def callback_handler(call):
             bot.answer_callback_query(call.id, "❌ আগের টাস্ক শেষ হোক")
 
 def show_status(chat_id):
+    """Show current status"""
+    unblocked = otp_bot.check_and_unblock_numbers()
+    
     status_text = (
         f"📊 **বর্তমান স্ট্যাটাস**\n\n"
         f"🔑 API Keys: {len(otp_bot.api_keys)}\n"
@@ -532,15 +697,22 @@ def show_status(chat_id):
         f"📊 টোটাল সেন্ট: {otp_bot.stats['total_sent']}\n"
         f"❌ টোটাল ফেইল: {otp_bot.stats['total_failed']}\n"
         f"🚫 টোটাল ব্লক: {otp_bot.stats['total_blocked']}\n"
-        f"⚙️ চালু আছে: {'হ্যাঁ' if otp_bot.is_running else 'না'}\n"
+        f"⚙️ চলছে: {'হ্যাঁ' if otp_bot.is_running else 'না'}\n"
     )
     
+    if otp_bot.is_running:
+        status_text += f"\n{otp_bot.get_status()}"
+    
     if otp_bot.current_api_index < len(otp_bot.api_keys):
-        status_text += f"\nবর্তমান API: {otp_bot.current_api_index + 1}"
+        status_text += f"\n\nবর্তমান API: {otp_bot.current_api_index + 1}"
+    
+    if unblocked:
+        status_text += f"\n\n✅ {len(unblocked)} টি নাম্বার আনব্লক হয়েছে"
     
     bot.send_message(chat_id, status_text, parse_mode='Markdown')
 
 def show_api_list(chat_id):
+    """Show API keys list"""
     if not otp_bot.api_keys:
         bot.send_message(chat_id, "❌ কোন API key নেই!\n/add_api কমান্ড ব্যবহার করুন")
         return
@@ -557,12 +729,15 @@ def show_api_list(chat_id):
     bot.send_message(chat_id, text)
 
 def show_blocked_list(chat_id):
+    """Show blocked numbers list"""
+    otp_bot.check_and_unblock_numbers()
+    
     if not otp_bot.blocked_until:
         bot.send_message(chat_id, "✅ কোন ব্লক করা নাম্বার নেই")
         return
     
     text = "🚫 **ব্লক করা নাম্বার:**\n\n"
-    for number, until in list(otp_bot.blocked_until.items())[:10]:  # Show first 10
+    for number, until in list(otp_bot.blocked_until.items())[:10]:
         remaining = (until - datetime.now()).seconds // 60
         text += f"📞 {number}\n"
         text += f"   └ আনব্লক হবে: {remaining} মিনিট পর\n"
@@ -573,6 +748,7 @@ def show_blocked_list(chat_id):
     bot.send_message(chat_id, text, parse_mode='Markdown')
 
 def show_settings(chat_id):
+    """Show settings"""
     markup = InlineKeyboardMarkup(row_width=2)
     markup.add(
         InlineKeyboardButton("⏱️ Delay: 3s", callback_data="delay_3"),
@@ -590,20 +766,18 @@ def show_settings(chat_id):
 
 # মনিটরিং থ্রেড
 def monitor_blocked_numbers():
+    """Monitor and unblock expired numbers"""
     while True:
-        current_time = datetime.now()
-        to_remove = []
-        
-        for number, block_until in otp_bot.blocked_until.items():
-            if current_time >= block_until:
-                to_remove.append(number)
-        
-        for number in to_remove:
-            del otp_bot.blocked_until[number]
-            logger.info(f"Number {number} unblocked automatically")
-        
-        if to_remove:
+        try:
+            unblocked = otp_bot.check_and_unblock_numbers()
+            
+            if unblocked:
+                logger.info(f"Auto-unblocked {len(unblocked)} numbers")
+            
             otp_bot.save_blocked_numbers()
+            
+        except Exception as e:
+            logger.error(f"Error in monitor thread: {e}")
         
         time.sleep(60)
 
@@ -611,24 +785,28 @@ def monitor_blocked_numbers():
 if __name__ == "__main__":
     print("""
     ╔══════════════════════════════════╗
-    ║     TELEGRAM OTP BOT v3.0        ║
-    ║   Telegram Control + Auto Switch  ║
+    ║     TELEGRAM OTP BOT v4.0        ║
+    ║   Auto Pause & Resume on Block   ║
     ╚══════════════════════════════════╝
     """)
     
-    # Initialize bot
+    print("ফিচারসমূহ:")
+    print("• কোন নাম্বার ব্লক হলে পুরো প্রসেস ১ ঘন্টা পজ")
+    print("• ১ ঘন্টা পর আবার শুরু")
+    print("• স্টপ না দেওয়া পর্যন্ত চলতে থাকবে")
+    print("• API অটো সুইচ")
+    print("• ব্লক লিস্ট মনিটর")
+    
     otp_bot = OTPBot()
     
-    # Start monitor thread
     monitor_thread = threading.Thread(target=monitor_blocked_numbers, daemon=True)
     monitor_thread.start()
     
-    # Notify admin that bot is running
     try:
-        bot.send_message(ADMIN_ID, "🤖 বট চালু হয়েছে!\n/start কমান্ড দিন")
+        bot.send_message(ADMIN_ID, "🤖 বট v4.0 চালু হয়েছে!\n/start কমান্ড দিন")
     except:
         print("⚠️ Admin notification failed")
     
-    # Start telegram bot
     print("✅ Telegram bot is running...")
+    print("📌 Commands: /start, /stop, /status, /add_api, /remove_api")
     bot.infinity_polling()
